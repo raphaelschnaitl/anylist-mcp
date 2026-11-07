@@ -48,9 +48,11 @@ function migrate(db) {
     "ALTER TABLE oauth_clients ADD COLUMN client_secret_hash TEXT",
     "ALTER TABLE oauth_clients ADD COLUMN user_id TEXT REFERENCES users(id)",
     "ALTER TABLE oauth_clients ADD COLUMN client_name TEXT",
+    "ALTER TABLE users ADD COLUMN oidc_sub TEXT",
   ]) {
     try { db.exec(sql); } catch { /* column already exists */ }
   }
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_oidc_sub ON users(oidc_sub)");
 
   // Make code_challenge nullable to support confidential clients that skip PKCE.
   // SQLite can't ALTER COLUMN, so recreate the table if the old NOT NULL constraint is still in place.
@@ -156,10 +158,15 @@ export function isEmailAllowed(email) {
   return _allowedEmails.has(email.toLowerCase());
 }
 
-/** True if the user exists and their email is still on the allowlist. */
+/**
+ * True if the user may still get tokens: with single sign-on (OIDC_ISSUER), every user
+ * signed in through it; otherwise, users whose email is still on the allowlist.
+ */
 export function isUserAllowed(userId) {
   const user = getUserById(userId);
-  return !!user && isEmailAllowed(user.email);
+  if (!user) return false;
+  if (process.env.OIDC_ISSUER) return !!user.oidc_sub;
+  return isEmailAllowed(user.email);
 }
 
 // ── User queries ──────────────────────────────────────────────────────────────
@@ -176,11 +183,29 @@ export function getUserByGoogleSub(sub) {
   return getDb().prepare("SELECT * FROM users WHERE google_sub = ?").get(sub);
 }
 
-export function createUser({ id, email, pwHash = null, googleSub = null }) {
+export function createUser({ id, email, pwHash = null, googleSub = null, oidcSub = null }) {
   getDb().prepare(`
-    INSERT INTO users (id, email, pw_hash, google_sub) VALUES (?, ?, ?, ?)
-  `).run(id, email.toLowerCase(), pwHash, googleSub);
+    INSERT INTO users (id, email, pw_hash, google_sub, oidc_sub) VALUES (?, ?, ?, ?, ?)
+  `).run(id, email.toLowerCase(), pwHash, googleSub, oidcSub);
   return getUserById(id);
+}
+
+export function getUserByOidcSub(sub) {
+  return getDb().prepare("SELECT * FROM users WHERE oidc_sub = ?").get(sub);
+}
+
+/**
+ * Links an existing account to an OIDC identity. Drops its password and every token
+ * and code issued before, so nothing from the self-registered account survives.
+ */
+export function linkOidcSub(userId, sub) {
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare("UPDATE users SET oidc_sub = ?, pw_hash = NULL WHERE id = ?").run(sub, userId);
+    db.prepare("DELETE FROM oauth_tokens WHERE user_id = ?").run(userId);
+    db.prepare("DELETE FROM oauth_codes WHERE user_id = ?").run(userId);
+  })();
+  return getUserById(userId);
 }
 
 // ── AnyList credential queries ────────────────────────────────────────────────

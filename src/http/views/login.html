@@ -40,6 +40,11 @@
     <div class="error">{{error}}</div>
     <!-- endif:error -->
 
+    <!-- if:oidcEnabled -->
+    <a href="/auth/oidc/login" class="btn btn-primary" style="text-align:center;text-decoration:none">Sign in</a>
+    <!-- endif:oidcEnabled -->
+
+    <!-- if:passwordEnabled -->
     <div class="tabs">
       <div class="tab active" onclick="switchTab('signin')">Sign In</div>
       <div class="tab" onclick="switchTab('register')">Register</div>
@@ -91,6 +96,7 @@
         <button type="submit" class="btn btn-primary">Create Account</button>
       </form>
     </div>
+    <!-- endif:passwordEnabled -->
   </div>
 
   <script>

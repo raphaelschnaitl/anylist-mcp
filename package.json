@@ -32,7 +32,8 @@
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "express-session": "^1.19.0",
-    "google-auth-library": "^10.6.2"
+    "google-auth-library": "^10.6.2",
+    "openid-client": "^6.8.9"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^7.0.0",
