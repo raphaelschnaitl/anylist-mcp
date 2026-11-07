@@ -12,6 +12,7 @@ import {
   getTokenByRefresh,
   deleteTokensByRefresh,
   getAnyListCredentials,
+  isUserAllowed,
 } from "../db.js";
 import { loginWithPassword, registerWithPassword } from "./providers/password.js";
 import { loginWithGoogle, isGoogleEnabled } from "./providers/google.js";
@@ -33,6 +34,33 @@ function baseUrl(req) {
   if (process.env.BASE_URL) return process.env.BASE_URL;
   if (req) return `${req.protocol}://${req.get("host")}${req.baseUrl || ""}`;
   return "http://localhost:3000";
+}
+
+function isHttpUrl(value) {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "https:" || protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rejects browser form posts sent from another origin (login CSRF and friends).
+ * Browsers always send Origin on cross-origin POSTs; requests without one are not
+ * from a cross-site page.
+ */
+export function requireSameOrigin(req, res, next) {
+  const origin = req.get("origin");
+  if (origin !== undefined) {
+    let host = null;
+    try { host = new URL(origin).host; } catch { /* "null" or malformed */ }
+    if (host !== req.get("host")) {
+      console.log(`[auth] ANOMALOUS cross-origin form post: path=${req.path} origin=${origin} ip=${req.ip}`);
+      return res.status(403).send("Cross-origin request rejected.");
+    }
+  }
+  next();
 }
 
 // ── OAuth AS Metadata (RFC 8414) ──────────────────────────────────────────────
@@ -71,7 +99,10 @@ router.post(["/oauth/register", "/register"], (req, res) => {
   const { redirect_uris, client_name } = req.body || {};
   const clientId = randomUUID();
   const redirectUri = Array.isArray(redirect_uris) ? redirect_uris[0] : redirect_uris || null;
-  registerOAuthClient({ clientId, redirectUri });
+  if (!isHttpUrl(redirectUri)) {
+    return res.status(400).json({ error: "invalid_redirect_uri", error_description: "An http(s) redirect_uri is required" });
+  }
+  registerOAuthClient({ clientId, redirectUri, clientName: client_name });
   res.status(201).json({
     client_id: clientId,
     client_secret: null,
@@ -93,15 +124,34 @@ router.get(["/oauth/authorize", "/authorize"], (req, res) => {
     return res.status(400).send("Missing required parameter: client_id");
   }
 
-  // Confidential clients (those with a client_secret) don't use PKCE
   const clientRecord = getOAuthClientWithSecret(client_id);
-  const isConfidential = !!(clientRecord && clientRecord.client_secret_hash);
+  if (!clientRecord) {
+    return res.status(400).send("Unknown client_id");
+  }
+  if (!isHttpUrl(redirect_uri)) {
+    return res.status(400).send("Missing or invalid parameter: redirect_uri");
+  }
+  // Public clients must use the redirect URI they registered. Confidential clients
+  // (scripts/create-client.js) have none on record, but their codes are useless
+  // without the client secret.
+  const isConfidential = !!clientRecord.client_secret_hash;
+  if (clientRecord.redirect_uri ? redirect_uri !== clientRecord.redirect_uri : !isConfidential) {
+    return res.status(400).send("redirect_uri does not match the registered redirect URI");
+  }
+
+  // Confidential clients (those with a client_secret) don't use PKCE
   if (!isConfidential && !code_challenge) {
     return res.status(400).send("Missing required parameter: code_challenge");
   }
+  if (code_challenge && (code_challenge_method || "S256") !== "S256") {
+    return res.status(400).send("Unsupported code_challenge_method (only S256 is supported)");
+  }
 
-  // Store OAuth params in session
-  req.session.oauthParams = { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope };
+  // Store OAuth params in session. requestId ties the consent form to this request.
+  req.session.oauthParams = {
+    client_id, redirect_uri, state, code_challenge, code_challenge_method: "S256", scope,
+    requestId: randomBytes(16).toString("hex"),
+  };
 
   // If the user already has an active session, skip the login step
   if (req.session.userId) {
@@ -145,28 +195,28 @@ async function handleAuthCodeGrant(req, res) {
     return res.status(400).json({ error: "invalid_grant", error_description: "Code invalid or expired" });
   }
 
-  if (code_verifier) {
-    // Public client: verify PKCE
-    const expected = codeRow.code_challenge;
-    const method = codeRow.challenge_method;
-    const verifierHash = method === "S256"
-      ? createHash("sha256").update(code_verifier).digest("base64url")
-      : code_verifier; // plain (discouraged)
-    if (verifierHash !== expected) {
+  // The code is bound to the client and redirect URI it was issued for.
+  if ((client_id && client_id !== codeRow.client_id) || redirect_uri !== codeRow.redirect_uri) {
+    return res.status(400).json({ error: "invalid_grant", error_description: "Code was issued to another client or redirect_uri" });
+  }
+
+  if (codeRow.code_challenge) {
+    if (!code_verifier) {
+      return res.status(400).json({ error: "invalid_request", error_description: "Missing code_verifier" });
+    }
+    const verifierHash = createHash("sha256").update(code_verifier).digest("base64url");
+    if (verifierHash !== codeRow.code_challenge) {
       return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
     }
-  } else if (client_id && client_secret) {
-    // Confidential client: verify client secret
-    const client = getOAuthClientWithSecret(client_id);
-    if (!client || !client.client_secret_hash || client_id !== codeRow.client_id) {
-      return res.status(401).json({ error: "invalid_client" });
-    }
-    const valid = await bcrypt.compare(client_secret, client.client_secret_hash);
-    if (!valid) {
-      return res.status(401).json({ error: "invalid_client" });
-    }
-  } else {
-    return res.status(400).json({ error: "invalid_request", error_description: "Missing code_verifier or client credentials" });
+  }
+
+  // Confidential clients must authenticate, whether or not they also used PKCE.
+  if (!(await authenticateConfidentialClient(codeRow.client_id, client_secret))) {
+    return res.status(401).json({ error: "invalid_client" });
+  }
+
+  if (!isUserAllowed(codeRow.user_id)) {
+    return res.status(400).json({ error: "invalid_grant", error_description: "User is no longer authorized" });
   }
 
   const accessToken = randomBytes(32).toString("hex");
@@ -189,13 +239,23 @@ async function handleAuthCodeGrant(req, res) {
 }
 
 async function handleRefreshGrant(req, res) {
-  const { refresh_token } = req.body;
+  const { refresh_token, client_id, client_secret } = req.body;
   if (!refresh_token) {
     return res.status(400).json({ error: "invalid_request" });
   }
   const tokenRow = getTokenByRefresh(refresh_token);
   if (!tokenRow || tokenRow.refresh_expires_at < Math.floor(Date.now() / 1000)) {
     return res.status(400).json({ error: "invalid_grant", error_description: "Refresh token invalid or expired" });
+  }
+  if (client_id && client_id !== tokenRow.client_id) {
+    return res.status(400).json({ error: "invalid_grant", error_description: "Refresh token was issued to another client" });
+  }
+  if (!(await authenticateConfidentialClient(tokenRow.client_id, client_secret))) {
+    return res.status(401).json({ error: "invalid_client" });
+  }
+  if (!isUserAllowed(tokenRow.user_id)) {
+    deleteTokensByRefresh(refresh_token);
+    return res.status(400).json({ error: "invalid_grant", error_description: "User is no longer authorized" });
   }
 
   deleteTokensByRefresh(refresh_token);
@@ -238,6 +298,9 @@ async function handleClientCredentialsGrant(req, res) {
     console.log(`[oauth] client_credentials secret mismatch: client_id=${client_id.slice(0, 8)}…`);
     return res.status(401).json({ error: "invalid_client" });
   }
+  if (!isUserAllowed(client.user_id)) {
+    return res.status(400).json({ error: "invalid_grant", error_description: "User is no longer authorized" });
+  }
 
   const accessToken = randomBytes(32).toString("hex");
   const refreshToken = randomBytes(32).toString("hex");
@@ -258,9 +321,19 @@ async function handleClientCredentialsGrant(req, res) {
   });
 }
 
+/**
+ * Returns false if clientId belongs to a confidential client and clientSecret does
+ * not match it. Public clients pass (they are bound by PKCE / the refresh token).
+ */
+async function authenticateConfidentialClient(clientId, clientSecret) {
+  const client = getOAuthClientWithSecret(clientId);
+  if (!client || !client.client_secret_hash) return true;
+  return !!clientSecret && bcrypt.compare(clientSecret, client.client_secret_hash);
+}
+
 // ── Login / Registration form handlers ───────────────────────────────────────
 
-router.post("/auth/login", async (req, res) => {
+router.post("/auth/login", requireSameOrigin, async (req, res) => {
   const { email, password } = req.body || {};
   console.log(`[auth] login attempt: ${email}`);
   if (!email || !password) {
@@ -276,7 +349,7 @@ router.post("/auth/login", async (req, res) => {
   }
 });
 
-router.post("/auth/register", async (req, res) => {
+router.post("/auth/register", requireSameOrigin, async (req, res) => {
   const { email, password } = req.body || {};
   console.log(`[auth] register attempt: ${email}`);
   if (!email || !password) {
@@ -292,7 +365,7 @@ router.post("/auth/register", async (req, res) => {
   }
 });
 
-router.post("/auth/google", async (req, res) => {
+router.post("/auth/google", requireSameOrigin, async (req, res) => {
   const { credential } = req.body || {};
   try {
     const user = await loginWithGoogle(credential);
@@ -305,24 +378,27 @@ router.post("/auth/google", async (req, res) => {
 
 /**
  * After successful authentication, check if the user has AnyList credentials.
- * If yes: issue OAuth code and redirect back to the client.
+ * If yes: ask for consent before issuing an OAuth code.
  * If no: redirect to /setup to collect them first.
  */
 function completeAuth(req, res, user) {
-  req.session.userId = user.id;
   const oauth = req.session.oauthParams;
-  const hasCreds = !!getAnyListCredentials(user.id);
-  console.log(`[auth] completeAuth user:${user.id} oauthPending:${!!oauth} hasCreds:${hasCreds}`);
+  // Fresh session ID on login, so a session cookie planted before login is worthless.
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error("[auth] session regenerate failed:", err);
+      return res.status(500).send("Internal server error");
+    }
+    req.session.userId = user.id;
+    if (oauth) req.session.oauthParams = oauth;
+    const hasCreds = !!getAnyListCredentials(user.id);
+    console.log(`[auth] completeAuth user:${user.id} oauthPending:${!!oauth} hasCreds:${hasCreds}`);
 
-  if (!oauth) {
-    return res.redirect("/setup");
-  }
-
-  if (!hasCreds) {
-    return res.redirect("/setup");
-  }
-
-  return issueCodeAndRedirect(req, res, user.id, oauth);
+    if (!oauth || !hasCreds) {
+      return res.redirect("/setup");
+    }
+    return res.redirect("/oauth/consent");
+  });
 }
 
 /**
@@ -332,21 +408,31 @@ router.get("/oauth/consent", (req, res) => {
   if (!req.session.userId || !req.session.oauthParams) {
     return res.redirect("/login");
   }
-  // Render consent view
+  const oauth = req.session.oauthParams;
+  const client = getOAuthClient(oauth.client_id);
   res.render("consent", {
-    clientId: req.session.oauthParams.client_id,
-    scope: req.session.oauthParams.scope || "mcp",
+    clientId: oauth.client_id,
+    clientName: client?.client_name || "An MCP client",
+    redirectHost: new URL(oauth.redirect_uri).host,
+    requestId: oauth.requestId,
+    scope: oauth.scope || "mcp",
   });
 });
 
-router.post("/oauth/consent", (req, res) => {
-  const { approve } = req.body || {};
+router.post("/oauth/consent", requireSameOrigin, (req, res) => {
+  const { approve, request_id } = req.body || {};
   const oauth = req.session.oauthParams;
   const userId = req.session.userId;
 
   if (!userId || !oauth) return res.redirect("/login");
 
+  // Another /authorize request may have replaced the one this form was shown for.
+  if (request_id !== oauth.requestId) {
+    return res.status(400).send("This authorization request has changed or expired. Start again from your client.");
+  }
+
   if (approve !== "yes") {
+    delete req.session.oauthParams;
     const redirectUri = oauth.redirect_uri;
     const state = oauth.state;
     const url = new URL(redirectUri);

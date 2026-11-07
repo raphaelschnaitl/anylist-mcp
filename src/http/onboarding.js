@@ -2,6 +2,7 @@ import { Router } from "express";
 import AnyListClient from "../anylist-client.js";
 import { upsertAnyListCredentials, getAnyListCredentials } from "./db.js";
 import { evictSession } from "./session-manager.js";
+import { requireSameOrigin } from "./auth/oauth.js";
 
 const router = Router();
 
@@ -19,7 +20,7 @@ router.get("/setup", (req, res) => {
 });
 
 // POST /setup — save AnyList credentials
-router.post("/setup", async (req, res) => {
+router.post("/setup", requireSameOrigin, async (req, res) => {
   if (!req.session.userId) return res.redirect("/login");
 
   const { anylist_username, anylist_password, default_list } = req.body || {};

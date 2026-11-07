@@ -34,5 +34,6 @@ export async function loginWithPassword(email, password) {
   }
   const match = await bcrypt.compare(password, user.pw_hash);
   if (!match) throw new Error("Invalid email or password.");
+  if (!isEmailAllowed(user.email)) throw new Error("This account is no longer authorized.");
   return user;
 }

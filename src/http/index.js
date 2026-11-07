@@ -5,7 +5,6 @@ import express from "express";
 import session from "express-session";
 import { fileURLToPath } from "url";
 import path from "path";
-import { readFileSync } from "fs";
 import { randomBytes } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -18,6 +17,7 @@ import oauthRouter, { requireBearerToken } from "./auth/oauth.js";
 import onboardingRouter from "./onboarding.js";
 import { registerAllTools } from "../tools/index.js";
 import { isGoogleEnabled } from "./auth/providers/google.js";
+import { renderTemplate } from "./template.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -62,6 +62,7 @@ app.use(session({
     // secure=true only when the request actually arrived over HTTPS (via proxy).
     // When testing locally over plain HTTP this will be false, allowing cookies to work.
     secure: "auto",
+    sameSite: "lax",
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
   },
 }));
@@ -82,35 +83,7 @@ app.use((req, res, next) => {
 // View engine (simple HTML template rendering via res.render)
 app.set("views", path.join(__dirname, "views"));
 app.set("view engine", "html");
-app.engine("html", (filePath, options, callback) => {
-  try {
-    let content = readFileSync(filePath, "utf8");
-    for (const [k, v] of Object.entries(options)) {
-      // Section toggle: <!-- if:key -->...<!-- endif:key -->
-      // Truthy = boolean true, non-empty string, non-zero number
-      const startTag = `<!-- if:${k} -->`;
-      const endTag = `<!-- endif:${k} -->`;
-      if (content.includes(startTag)) {
-        const truthy = v !== null && v !== undefined && v !== false && v !== "" && v !== 0;
-        if (!truthy) {
-          const re = new RegExp(startTag + "[\\s\\S]*?" + endTag, "g");
-          content = content.replace(re, "");
-        } else {
-          content = content.replaceAll(startTag, "").replaceAll(endTag, "");
-        }
-      }
-      // Value replacement: {{key}}
-      if (typeof v === "string" || typeof v === "number") {
-        content = content.replaceAll(`{{${k}}}`, String(v));
-      } else if (v === null || v === undefined) {
-        content = content.replaceAll(`{{${k}}}`, "");
-      }
-    }
-    callback(null, content);
-  } catch (err) {
-    callback(err);
-  }
-});
+app.engine("html", renderTemplate);
 
 // ── Login page ────────────────────────────────────────────────────────────────
 
@@ -140,7 +113,7 @@ app.use(onboardingRouter);
 // session, keyed by the Mcp-Session-Id header. This is required for elicitation
 // to work (the server needs to maintain request context across the session).
 
-const mcpSessions = new Map(); // sessionId → { server, transport }
+const mcpSessions = new Map(); // sessionId → { server, transport, userId }
 
 function createMcpServer(userId) {
   const mcpServer = new McpServer({ name: "anylist-mcp-server", version: "1.9.0" });
@@ -155,9 +128,11 @@ async function handleMcp(req, res) {
     const sessionId = req.headers["mcp-session-id"];
     // Initialize requests always create a new session — never route to an existing one.
     // This handles clients (e.g. HA) that send a second initialize on a stale session ID.
-    const mcpSession = !isInitializeRequest(req.body) && sessionId
+    let mcpSession = !isInitializeRequest(req.body) && sessionId
       ? mcpSessions.get(sessionId)
       : null;
+    // A session ID only works with a token for the user who created the session.
+    if (mcpSession && mcpSession.userId !== req.userId) mcpSession = null;
 
     if (!mcpSession) {
       if (!isInitializeRequest(req.body)) {
@@ -171,7 +146,7 @@ async function handleMcp(req, res) {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomBytes(16).toString("hex"),
         onsessioninitialized: (sid) => {
-          mcpSessions.set(sid, { server: mcpServer, transport });
+          mcpSessions.set(sid, { server: mcpServer, transport, userId });
         },
       });
 
@@ -205,7 +180,7 @@ function makeSseConnectHandler(postEndpoint) {
       const transport = new SSEServerTransport(postEndpoint, res);
       const sessionId = transport.sessionId;
       const mcpServer = createMcpServer(req.userId);
-      mcpSessions.set(sessionId, { server: mcpServer, transport });
+      mcpSessions.set(sessionId, { server: mcpServer, transport, userId: req.userId });
       transport.onclose = () => { mcpSessions.delete(sessionId); };
       await mcpServer.connect(transport); // connect() calls transport.start() internally
     } catch (err) {
@@ -218,7 +193,7 @@ function makeSseConnectHandler(postEndpoint) {
 async function handleSseMessage(req, res) {
   try {
     const mcpSession = req.query.sessionId ? mcpSessions.get(req.query.sessionId) : null;
-    if (!mcpSession || !(mcpSession.transport instanceof SSEServerTransport)) {
+    if (!mcpSession || !(mcpSession.transport instanceof SSEServerTransport) || mcpSession.userId !== req.userId) {
       return res.status(404).json({ error: "SSE session not found." });
     }
     await mcpSession.transport.handlePostMessage(req, res, req.body);
