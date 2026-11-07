@@ -13,10 +13,11 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 import { getDb, loadAllowedEmails, deleteExpiredTokens } from "./db.js";
 import { getOrCreateSession } from "./session-manager.js";
-import oauthRouter, { requireBearerToken } from "./auth/oauth.js";
+import oauthRouter, { requireBearerToken, renderLogin } from "./auth/oauth.js";
 import onboardingRouter from "./onboarding.js";
 import { registerAllTools } from "../tools/index.js";
 import { isGoogleEnabled } from "./auth/providers/google.js";
+import { isOidcEnabled } from "./auth/providers/oidc.js";
 import { renderTemplate } from "./template.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +35,14 @@ function validateEnv() {
   if (process.env.SERVER_SECRET_KEY.length !== 64) {
     console.error("SERVER_SECRET_KEY must be a 64-character hex string (32 bytes).");
     process.exit(1);
+  }
+  if (isOidcEnabled()) {
+    const missingOidc = ["OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "BASE_URL"].filter(k => !process.env[k]);
+    if (missingOidc.length) {
+      console.error(`OIDC_ISSUER is set but these are missing: ${missingOidc.join(", ")}`);
+      process.exit(1);
+    }
+    return; // Single sign-on decides who may sign in; no allowlist file.
   }
   if (!process.env.BASE_URL) {
     console.warn("BASE_URL not set — will derive from incoming request Host header (fine for dev/tunnel use)");
@@ -88,11 +97,8 @@ app.engine("html", renderTemplate);
 // ── Login page ────────────────────────────────────────────────────────────────
 
 app.get("/login", (_req, res) => {
-  res.render("login", {
-    error: "",
-    googleEnabled: isGoogleEnabled(),
-    googleClientId: process.env.GOOGLE_CLIENT_ID || "",
-  });
+  if (isOidcEnabled()) return res.redirect("/auth/oidc/login");
+  renderLogin(res);
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -220,4 +226,5 @@ app.listen(PORT, () => {
   console.log(`anylist-mcp HTTP server listening on port ${PORT}`);
   console.log(`Base URL: ${process.env.BASE_URL || "(derived from request host)"}`);
   console.log(`Google OAuth: ${isGoogleEnabled() ? "enabled" : "disabled (set GOOGLE_CLIENT_ID to enable)"}`);
+  console.log(`Single sign-on: ${isOidcEnabled() ? `${process.env.OIDC_ISSUER} (group: ${process.env.OIDC_REQUIRED_GROUP || "any"})` : "disabled"}`);
 });

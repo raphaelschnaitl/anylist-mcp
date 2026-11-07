@@ -16,13 +16,23 @@ import {
 } from "../db.js";
 import { loginWithPassword, registerWithPassword } from "./providers/password.js";
 import { loginWithGoogle, isGoogleEnabled } from "./providers/google.js";
+import { isOidcEnabled, startOidcLogin, finishOidcLogin } from "./providers/oidc.js";
 
-function renderLogin(res, error = "") {
+export function renderLogin(res, error = "") {
+  const oidcEnabled = isOidcEnabled();
   res.render("login", {
     error,
-    googleEnabled: isGoogleEnabled(),
+    oidcEnabled,
+    passwordEnabled: !oidcEnabled,
+    googleEnabled: !oidcEnabled && isGoogleEnabled(),
     googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   });
+}
+
+/** With single sign-on configured, the local password / Google sign-in routes are off. */
+function requireLocalLogin(req, res, next) {
+  if (isOidcEnabled()) return res.status(404).send("Not found");
+  next();
 }
 
 const router = Router();
@@ -333,7 +343,7 @@ async function authenticateConfidentialClient(clientId, clientSecret) {
 
 // ── Login / Registration form handlers ───────────────────────────────────────
 
-router.post("/auth/login", requireSameOrigin, async (req, res) => {
+router.post("/auth/login", requireLocalLogin, requireSameOrigin, async (req, res) => {
   const { email, password } = req.body || {};
   console.log(`[auth] login attempt: ${email}`);
   if (!email || !password) {
@@ -349,7 +359,7 @@ router.post("/auth/login", requireSameOrigin, async (req, res) => {
   }
 });
 
-router.post("/auth/register", requireSameOrigin, async (req, res) => {
+router.post("/auth/register", requireLocalLogin, requireSameOrigin, async (req, res) => {
   const { email, password } = req.body || {};
   console.log(`[auth] register attempt: ${email}`);
   if (!email || !password) {
@@ -365,13 +375,38 @@ router.post("/auth/register", requireSameOrigin, async (req, res) => {
   }
 });
 
-router.post("/auth/google", requireSameOrigin, async (req, res) => {
+router.post("/auth/google", requireLocalLogin, requireSameOrigin, async (req, res) => {
   const { credential } = req.body || {};
   try {
     const user = await loginWithGoogle(credential);
     return completeAuth(req, res, user);
   } catch (err) {
     console.log(`[auth] google failed — ${err.message}`);
+    return renderLogin(res, err.message);
+  }
+});
+
+// ── Single sign-on (OIDC) ────────────────────────────────────────────────────
+
+router.get("/auth/oidc/login", async (req, res) => {
+  if (!isOidcEnabled()) return res.status(404).send("Not found");
+  try {
+    res.redirect(await startOidcLogin(req.session));
+  } catch (err) {
+    console.error("[auth] oidc start failed:", err);
+    res.status(502).send("Sign-in is unavailable right now.");
+  }
+});
+
+router.get("/auth/oidc/callback", async (req, res) => {
+  if (!isOidcEnabled()) return res.status(404).send("Not found");
+  try {
+    const user = await finishOidcLogin(req.session, new URL(req.originalUrl, process.env.BASE_URL));
+    console.log(`[auth] oidc login success: ${user.email} (${user.id})`);
+    return completeAuth(req, res, user);
+  } catch (err) {
+    console.log(`[auth] oidc login failed — ${err.message}`);
+    res.status(403);
     return renderLogin(res, err.message);
   }
 });
