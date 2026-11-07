@@ -156,6 +156,12 @@ export function isEmailAllowed(email) {
   return _allowedEmails.has(email.toLowerCase());
 }
 
+/** True if the user exists and their email is still on the allowlist. */
+export function isUserAllowed(userId) {
+  const user = getUserById(userId);
+  return !!user && isEmailAllowed(user.email);
+}
+
 // ── User queries ──────────────────────────────────────────────────────────────
 
 export function getUserById(id) {
@@ -207,10 +213,10 @@ export function getOAuthClient(clientId) {
   return getDb().prepare("SELECT * FROM oauth_clients WHERE client_id = ?").get(clientId);
 }
 
-export function registerOAuthClient({ clientId, redirectUri }) {
+export function registerOAuthClient({ clientId, redirectUri, clientName }) {
   getDb().prepare(`
-    INSERT OR IGNORE INTO oauth_clients (client_id, redirect_uri) VALUES (?, ?)
-  `).run(clientId, redirectUri || null);
+    INSERT OR IGNORE INTO oauth_clients (client_id, redirect_uri, client_name) VALUES (?, ?, ?)
+  `).run(clientId, redirectUri || null, clientName || null);
   return getOAuthClient(clientId);
 }
 

@@ -25,20 +25,21 @@ export async function loginWithGoogle(idToken) {
     audience: process.env.GOOGLE_CLIENT_ID,
   });
   const payload = ticket.getPayload();
-  const { sub, email } = payload;
+  const { sub, email, email_verified } = payload;
 
-  if (!email) throw new Error("Google account has no email.");
+  if (!email || !email_verified) throw new Error("Google account has no verified email.");
 
   // Check if user already exists by Google sub
   let user = getUserByGoogleSub(sub);
-  if (user) return user;
-
-  // Check if user exists by email (e.g. registered via password first)
-  user = getUserByEmail(email);
   if (user) {
-    // Link Google sub to existing account
-    // (simple update — not handling full account merge)
+    if (!isEmailAllowed(user.email)) throw new Error("This Google account is not authorized.");
     return user;
+  }
+
+  // Never sign a Google identity into an account created another way: password
+  // registration does not verify the email, so that account may belong to someone else.
+  if (getUserByEmail(email)) {
+    throw new Error("An account with this email already exists. Sign in with your password.");
   }
 
   // New user — check whitelist before creating
